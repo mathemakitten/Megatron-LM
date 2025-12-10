@@ -1115,6 +1115,14 @@ def validate_args(args, defaults={}):
                 assert not args.distrib_optim_fully_reshardable_mem_efficient, \
                     '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
 
+    if args.fake_process_group:
+        assert args.moe_token_dispatcher_type != "flex", "Fake process group is not supported with flex token dispatcher."
+        # Disable nan check for fake process group
+        args.check_for_nan_in_loss_and_grad = False
+        warn_rank_0('check_for_nan_in_loss_and_grad is set to False for fake process group.')
+        # Disable gloo process groups for fake process group
+        args.enable_gloo_process_groups = False
+        warn_rank_0('enable_gloo_process_groups is set to False for fake process group.')
 
     # Checkpointing
     if args.ckpt_fully_parallel_save_deprecated and args.rank == 0:
@@ -1209,10 +1217,12 @@ def validate_args(args, defaults={}):
         if args.transformer_impl == 'transformer_engine' and not args.te_rng_tracker:
             args.te_rng_tracker = True
             warn_rank_0("te_rng_tracker is not enabled, enabling it for CUDA graphs.", args.rank)
-        assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
-            "expandable_segments:True may not be safe when using CUDA Graphs with some specific parallel settings. "
-            "The training may crash with illegal memory access."
-        )
+
+        if torch.cuda.get_device_capability()[0] < 10:
+            assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
+                "expandable_segments:True may not be safe when using CUDA Graphs with some specific parallel settings. "
+                "The training may crash with illegal memory access."
+            )
         assert (
             args.recompute_granularity != 'full'
         ), 'recompute_granularity must not be full when CUDA Graphs are enabled.'
@@ -1430,15 +1440,20 @@ def _add_inference_args(parser):
                        '"none": no CUDA graph. '
                        '"local": capture the CUDA graph using MCore local implementation. --cuda-graph-scope=\"full_iteration\" enables whole iteration CUDA graph. '
                        '"transformer_engine": capture the CUDA graph using TE make_graphed_callables().')
-    group.add_argument('--cuda-graph-scope', type=str, default='full',
-                       choices=['full', 'attn', 'full_iteration'],
-                       help='Determines the CUDA graphs capturing scope. Valid values are '
-                       '\"full\", \"attn\" and \"full_iteration\". \"Full\" scope captures a whole '
-                       'Transformer layer. \"Attn\" scope only captures operations in '
-                       'TransformerLayer._forward_attention(). \"ful_iteration\" scope captures a '
-                       'whole iteration. '
-                       'full_iteration scope is only supported with --cuda-graph-impl=local, '
-                       'attn scope is only supported with --cuda-graph-impl=transformer_engine.')
+    group.add_argument('--cuda-graph-scope', nargs='+', type=str, default=[],
+                       help='Determines the CUDA graphs capturing scope. '
+                       'choices: "attn", "mlp", "moe", "moe_router", "moe_preprocess", "mamba", "full_iteration". '
+                       '"attn": captures operations in TransformerLayer._forward_attention(). '
+                       '"mlp": captures operations in TransformerLayer._forward_mlp() for a dense layer. '
+                       '"moe": captures operations in TransformerLayer._forward_mlp() for a MoE layer. '
+                       '"moe_router": captures operations in TransformerLayer._forward_mlp() up to MoELayer.router(), '
+                       'including the shared experts if they are not overlapped with EP comm. '
+                       '"moe_preprocess": captures operations in MoELayer.preprocess(). Must be used together with "moe_router". '
+                       '"mamba": captures the mamba layer. '
+                       '"full_iteration": captures a whole iteration. '
+                       'full_iteration scope is only supported with --cuda-graph-impl=local, other scopes are only supported with --cuda-graph-impl=transformer_engine. '
+                       'If not specified, the default scope is to capture the whole Transformer layer.')
+
     group.add_argument('--use-legacy-static-engine', action='store_true', default=False,
                        help='Use legacy static engine. (Current static engine uses dynamic engine under the hood)',
                        dest='use_legacy_static_engine')
@@ -1506,7 +1521,7 @@ def _add_inference_args(parser):
     group.add_argument('--disable-chunked-prefill', default=False, action="store_true",
                        help='Disable chunked prefill (chunked prefill is enabled by default).')  
     group.add_argument('--inference-dynamic-batching-cuda-graph-max-tokens',
-                       type=int, default=1024,
+                       type=int, default=16384,
                        help='Maximum number of tokens to capture in a cuda graph.')
     group.add_argument('--inference-dynamic-batching-cuda-graph-mixed-prefill-count',
                        type=int, default=16,
@@ -2774,6 +2789,10 @@ def _add_distributed_args(parser):
                        "and must be consistent across all ranks.")
     group.add_argument('--replication-factor', default=2, type=int,
                        help="Number of machines storing the replica of a given rank's data.")
+    group.add_argument('--fake-process-group', action='store_true', default=False,
+                       help='If set, initialize with fake distributed process group and all distributed communication operations will be skipped. \
+                       This is quite useful for profiling memory usage of distributed training with just one GPU. \
+                       Setting WORLD_SIZE and RANK to the specific values for target distribtued scale.')
     return parser
 
 
