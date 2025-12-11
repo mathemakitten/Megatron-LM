@@ -598,6 +598,8 @@ class DynamicInferenceEngine(AbstractEngine):
             # memory addresses, so the cuda graphs are re-used.
             capture_time = time.time()
             if self.unified_memory_level == 0 and not self.persist_cuda_graphs:
+                print("HERE FOR SOME REASON")
+                torch.distributed.breakpoint()
                 self.create_cuda_graphs()
             capture_time = time.time() - capture_time
 

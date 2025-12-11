@@ -2433,6 +2433,8 @@ def megatron_rl_inference_mode(
         # TODO: Improve this if statement once a change is made to CUDA graph handling.
         cuda_graph_exists = len(_CudagraphGlobalRecord.cudagraph_inference_record) != 0
         if cuda_graph_impl != "none" and not cuda_graph_exists:
+            print("NO CUDAGRAPHS FOUND")
+            torch.distributed.breakpoint()
             with nvtx_range("wait-for-decode-only"):
                 while not inference_interface._inference_engine.context.is_decode_only():
                     active_requests, finished_requests, step_time = loop.run_until_complete(

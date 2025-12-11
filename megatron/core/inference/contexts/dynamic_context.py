@@ -1129,6 +1129,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         Adds dummy requests to reflect the number of prefill and decode requests in the graph config.
         These are using during cuda graph captures.
         """
+        print("HIT add_dummy_requests_for_cudagraph_capture")
         prefill_tokens = graph_dimensions.token_count - graph_dimensions.decode_req_count
 
         # Pre-construct shared objects (safe due to deep copy in DynamicInferenceRequest.__post_init__)
