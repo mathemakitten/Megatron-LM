@@ -708,6 +708,11 @@ class _CudaGraphRunner(torch.nn.Module):
             ten.is_cudagraph_input = True
         # input buffer now finalized
 
+        self._graph_strong_refs = getattr(self, "_graph_strong_refs", [])
+        self._graph_strong_refs.extend(self.fwd_graph_input_surface)
+        # fwd_graph_outputs already normalized to tuple above
+        # self._graph_strong_refs.extend(self.fwd_graph_output_surface)
+
         ctx = torch.no_grad() if not self.grad_enabled else nullcontext()
         with ctx:
             # warmup again as case graph capture mode may execute a different codepath
@@ -1480,6 +1485,9 @@ class CudaGraphManager(torch.nn.Module):
                     self.call_ddp_preforward_hook(module)
 
             runner = self.get_cudagraph_runner(megatron_module, args, kwargs)
+            # if self.training and torch.is_grad_enabled():
+            #     print("IS THIS BROKEN?")
+            #     torch.distributed.breakpoint()
             out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
         else:
             if 'inference_context' in kwargs.keys() and kwargs['inference_context']:
@@ -1522,7 +1530,6 @@ class CudaGraphManager(torch.nn.Module):
                     _CudagraphGlobalRecord.cudagraph_inference_record.append(
                         (runner, "fwd", args, kwargs)
                     )
-                    print("ADDED RUNNER")
 
                 # Now replay the graph
                 out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
@@ -1535,6 +1542,15 @@ class CudaGraphManager(torch.nn.Module):
                     # If the layer is frozen, we need to set the runner to eval mode.
                     runner.eval()
                 out = runner.record_graph_capture(args, kwargs)
+            else:
+                # No cudagraphs were found in training mode with grad disabled, so fallback to
+                # eager since autograd is needed to correctly trace the backward graph.
+                return super(MegatronModule, megatron_module).__call__(*args, **kwargs)
+
+            # else:  # get ref logprobs, where self.training is False — first time around this will run eager
+            #     print("WTF this should never happen")
+            #     assert False, "this should never happen"
+            #     torch.distributed.breakpoint()
 
         self.is_first_microbatch = False
         # If forward only, next replay should be a forward pass as well
