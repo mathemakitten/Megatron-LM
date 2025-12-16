@@ -273,6 +273,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
             context.cuda_graph_batch_dimensions_list = filtered_cuda_graph_batch_dimensions_list
 
+        # context.cuda_graph_batch_dimensions_list = [512]
+        # print(f"context.cuda_graph_batch_dimensions_list: {context.cuda_graph_batch_dimensions_list}")
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
 

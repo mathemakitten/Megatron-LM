@@ -172,7 +172,7 @@ class CUDAGraphBatchDimensionBuilder:
 
         # Cuda graph token counts.
         if num_cuda_graphs == 1:
-            cuda_graph_token_counts = [cuda_graph_max_tokens]
+            cuda_graph_token_counts = [512] #[cuda_graph_max_tokens]
         else:
             cuda_graph_token_counts = list(
                 range(cuda_graph_step_size, cuda_graph_max_tokens, cuda_graph_step_size)
