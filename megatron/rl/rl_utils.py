@@ -875,6 +875,7 @@ def prepare_data_for_update(
                 (mpu.get_data_parallel_rank() + 1) * data_split_size,
             )
             rollouts = rollouts[data_split_range[0] : data_split_range[1]]
+
             # First we calculate them on a global level and then we split and recalculate on a local level.
             # Sequence packing and reporting needs it global but non-packing wants it local.
             rewards = torch.tensor([[r.reward for r in group] for group in rollouts], device='cpu')
@@ -894,7 +895,7 @@ def prepare_data_for_update(
         if args.rl_use_sequence_packing:
             with nvtx_range("sequence_packing", time=True):
                 runtime_state.packing_context = packing_context = pack_all_trajectories(
-                    trajs, 
+                    trajs,
                     generation_masks, 
                     inference_logprobs, 
                     global_advantages, 
@@ -968,6 +969,7 @@ def prepare_data_for_update(
                         packed_seq_params=b_packed_seq_params,
                     ),
                     None,
+                    0  # These tokens do not count toward the tokens/second calculation
                 )
 
             dtype = (
