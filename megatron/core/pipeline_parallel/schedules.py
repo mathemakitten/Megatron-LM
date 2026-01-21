@@ -414,9 +414,10 @@ def forward_step(
         context_manager = contextlib.nullcontext()
     with context_manager:
         if checkpoint_activations_microbatch is None:
-            output_tensor, loss_func = forward_step_func(data_iterator, model)
+            output = forward_step_func(data_iterator, model)
+            output_tensor, loss_func, num_empty_bins = output
         else:
-            output_tensor, loss_func = forward_step_func(
+            output_tensor, loss_func, num_empty_bins = forward_step_func(
                 data_iterator, model, checkpoint_activations_microbatch
             )
     output_tensor, num_tokens = forward_step_calc_loss(
@@ -433,8 +434,8 @@ def forward_step(
     )
 
     if unwrap_output_tensor:
-        return output_tensor, num_tokens
-    return [output_tensor], num_tokens
+        return output_tensor, num_tokens, num_empty_bins
+    return [output_tensor], num_tokens, num_empty_bins
 
 
 def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config):
@@ -589,6 +590,7 @@ def forward_backward_no_pipelining(
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
 
     if config.overlap_moe_expert_parallel_comm and not forward_only:
+        num_empty_bins = 0
         forward_data_store, total_num_tokens = combined_1f1b_schedule_for_no_pipelining(
             forward_step_func,
             data_iterator,
@@ -626,7 +628,7 @@ def forward_backward_no_pipelining(
     else:
         with no_sync_func():
             for i in range(num_microbatches - 1):
-                output_tensor, num_tokens = forward_step(
+                output_tensor, num_tokens, num_empty_bins = forward_step(
                     forward_step_func,
                     data_iterator,
                     model,
@@ -646,7 +648,7 @@ def forward_backward_no_pipelining(
                     )
         # Run computation for last microbatch out of context handler (want to
         # synchronize gradients).
-        output_tensor, num_tokens = forward_step(
+        output_tensor, num_tokens, num_empty_bins = forward_step(
             forward_step_func,
             data_iterator,
             model,
@@ -688,6 +690,8 @@ def forward_backward_no_pipelining(
         and CudaGraphScope.full_iteration not in config.cuda_graph_scope
     ):
         create_cudagraphs()
+
+    forward_data_store.append(num_empty_bins)
 
     return forward_data_store
 
@@ -1990,6 +1994,8 @@ def forward_backward_pipelining_without_interleaving(
         data_iterator = data_iterator[0]
 
     config = get_model_config(model)
+    num_empty_bins = 0
+
     if config.overlap_p2p_comm:
         raise ValueError(
             "Non-interleaved pipeline parallelism does not support overlapping p2p communication"
@@ -2145,7 +2151,7 @@ def forward_backward_pipelining_without_interleaving(
         input_tensor = p2p_communicator.recv_forward(
             recv_tensor_shapes, is_pp_first_stage(p2p_communicator.pp_group)
         )
-        output_tensor, num_tokens = forward_step(
+        output_tensor, num_tokens, num_empty_bins = forward_step(
             forward_step_func,
             data_iterator,
             model,
@@ -2188,7 +2194,7 @@ def forward_backward_pipelining_without_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
-        output_tensor, num_tokens = forward_step(
+        output_tensor, num_tokens, num_empty_bins = forward_step(
             forward_step_func,
             data_iterator,
             model,
@@ -2315,5 +2321,7 @@ def forward_backward_pipelining_without_interleaving(
         and CudaGraphScope.full_iteration not in config.cuda_graph_scope
     ):
         create_cudagraphs()
+
+    forward_data_store.append(num_empty_bins)
 
     return forward_data_store

@@ -1132,6 +1132,7 @@ def prepare_data_for_update(
                         packed_seq_params=b_packed_seq_params,
                     ),
                     None,
+                    0  # These tokens do not count toward the tokens/second calculation
                 )
 
                 model.train()
