@@ -5,10 +5,10 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --segment=2
-#SBATCH --time=02:00:00
+#SBATCH --time=04:00:00
 #SBATCH --job-name=llmservice-vllm-inference
-#SBATCH --output=/lustre/fsw/portfolios/llmservice/users/helenn/logs/vllm-debug.out
-#SBATCH --error=/lustre/fsw/portfolios/llmservice/users/helenn/logs/vllm-debug.out
+#SBATCH --output=/lustre/fsw/portfolios/llmservice/users/helenn/logs/vllm-debug2.out
+#SBATCH --error=/lustre/fsw/portfolios/llmservice/users/helenn/logs/vllm-debug2.out
 #SBATCH --exclusive
 
 # =============================================================================
@@ -90,6 +90,11 @@ shift 4
 # Remaining args are the benchmark command
 
 NODE_RANK="${SLURM_NODEID:-0}"
+
+# Avoid Triton cache race conditions on shared filesystems.
+# Each node gets its own cache dir under local /tmp.
+export TRITON_CACHE_DIR="/tmp/triton_cache_${SLURM_JOB_ID}_node${NODE_RANK}"
+mkdir -p "$TRITON_CACHE_DIR"
 
 # On NVL72 all GPUs are physically accessible via NVSwitch. Ensure each node
 # only uses the GPUs SLURM allocated to it.
