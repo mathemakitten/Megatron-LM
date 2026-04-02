@@ -7,7 +7,7 @@
 #SBATCH --segment=4
 #SBATCH --time=04:00:00
 #SBATCH --job-name=llmservice-megatron-inference
-#SBATCH --output=/lustre/fsw/portfolios/llmservice/users/helenn/logs/keshav_ultra_20260331/bs128_row8_v2.log
+#SBATCH --output=/lustre/fsw/portfolios/llmservice/users/helenn/logs/keshav_ultra_20260331/bs128_row8_v3.log
 #SBATCH --error=/lustre/fsw/portfolios/llmservice/users/helenn/logs/ultra-debug.out
 #SBATCH --exclusive
 
@@ -136,7 +136,7 @@ srun \
     --inference-max-seq-length "$MAX_SEQ_LENGTH" \
     --transformer-impl inference_optimized \
     --sequence-parallel \
-    --inference-logging-step-interval 1000 \
+    --inference-logging-step-interval 10000 \
     --num-layers 108 \
     --hidden-size 8192 \
     --num-attention-heads 64 \
