@@ -5,10 +5,10 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --segment=2
-#SBATCH --time=04:00:00
+#SBATCH --time=00:30:00
 #SBATCH --job-name=llmservice-vllm-inference
-#SBATCH --output=/lustre/fsw/portfolios/llmservice/users/helenn/logs/vllm-debug2.out
-#SBATCH --error=/lustre/fsw/portfolios/llmservice/users/helenn/logs/vllm-debug2.out
+#SBATCH --output=/lustre/fsw/portfolios/llmservice/users/helenn/logs/vllm-debug.out
+#SBATCH --error=/lustre/fsw/portfolios/llmservice/users/helenn/logs/vllm-debug.out
 #SBATCH --exclusive
 
 # =============================================================================
@@ -180,6 +180,7 @@ srun \
         --dtype bfloat16 \
         --trust-remote-code \
         --max-model-len "$MAX_MODEL_LEN" \
+        --enable-chunked-prefill \
         --compilation-config '{"pass_config": {"fuse_allreduce_rms": false}}' \
         --batch-size "$BATCH_SIZE" \
         --num-input-tokens "$NUM_INPUT_TOKENS" \

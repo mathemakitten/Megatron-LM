@@ -5,7 +5,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --segment=4
-#SBATCH --time=00:55:00
+#SBATCH --time=00:45:00
 #SBATCH --job-name=llmservice-vllm-inference
 #SBATCH --output=/lustre/fsw/portfolios/llmservice/users/helenn/logs/vllm-debug.out
 #SBATCH --error=/lustre/fsw/portfolios/llmservice/users/helenn/logs/vllm-debug.out
@@ -86,11 +86,14 @@ shift 4
 
 NODE_RANK="${SLURM_NODEID:-0}"
 
+# Avoid Triton cache race conditions on shared filesystems.
+export TRITON_CACHE_DIR="/tmp/triton_cache_${SLURM_JOB_ID}_node${NODE_RANK}"
+mkdir -p "$TRITON_CACHE_DIR"
+
 echo "[Node $(hostname -s)] rank=$NODE_RANK  head=$HEAD_ADDR  dp_size=$DP_SIZE"
 
 if [ "$NODE_RANK" -eq 0 ]; then
     # Head node: start Ray head and run the benchmark.
-    # vLLM uses Ray to schedule engine cores on remote worker GPUs.
     ray start --head --port="$RAY_PORT" --num-gpus="$GPUS_PER_NODE"
 
     # Wait for all worker nodes to join the Ray cluster
@@ -110,16 +113,18 @@ if [ "$NODE_RANK" -eq 0 ]; then
     done
 
     if [ "$DP_SIZE" -gt 1 ]; then
+        # Head spawns 1 local DP engine core; Ray places the remaining
+        # DP-1 engine cores on worker nodes (each with TP GPUs).
         "$@" \
             --data-parallel-size "$DP_SIZE" \
-            --data-parallel-size-local "$DP_SIZE" \
-            --data-parallel-address "$HEAD_ADDR"
+            --data-parallel-size-local 1 \
+            --data-parallel-address "$HEAD_ADDR" \
+            --distributed-executor-backend ray
     else
         "$@"
     fi
 else
     # Worker node: join the Ray cluster and block until the job ends.
-    # The head node's vLLM process will schedule engine cores on these GPUs.
     ray start --address="$HEAD_ADDR:$RAY_PORT" --num-gpus="$GPUS_PER_NODE" --block
 fi
 LAUNCHER_EOF
@@ -138,11 +143,12 @@ srun \
         --model "$MODEL_PATH" \
         --tensor-parallel-size "$TP_SIZE" \
         --pipeline-parallel-size "$PP_SIZE" \
-        --distributed-executor-backend ray \
         --enable-expert-parallel \
+        --enable-chunked-prefill \
         --dtype bfloat16 \
         --trust-remote-code \
         --max-model-len "$MAX_MODEL_LEN" \
+        --compilation-config '{"pass_config": {"fuse_allreduce_rms": false}}' \
         --batch-size "$BATCH_SIZE" \
         --num-input-tokens "$NUM_INPUT_TOKENS" \
         --num-output-tokens "$NUM_OUTPUT_TOKENS"

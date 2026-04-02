@@ -7,8 +7,8 @@ from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
 from vllm.inputs import TokensPrompt
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-# Silence vLLM logging
-logging.getLogger('vllm').setLevel(logging.CRITICAL)
+# Set vLLM logging to INFO to see KV cache block allocation and scheduling
+logging.getLogger('vllm').setLevel(logging.INFO)
 
 
 async def process_request(engine, prompt_tokens, sampling_params, request_id):
