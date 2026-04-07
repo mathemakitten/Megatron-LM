@@ -5,10 +5,10 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --segment=4
-#SBATCH --time=01:00:00
+#SBATCH --time=03:00:00
 #SBATCH --job-name=llmservice-megatron-inference
-#SBATCH --output=/lustre/fsw/portfolios/llmservice/users/helenn/logs/keshav_ultra_20260331/sanity.log
-#SBATCH --error=/lustre/fsw/portfolios/llmservice/users/helenn/logs/ultra-debug.out
+#SBATCH --output=/lustre/fsw/portfolios/llmservice/users/helenn/logs/keshav_ultra_20260331/bs4-siddharthfix1.out
+#SBATCH --error=/lustre/fsw/portfolios/llmservice/users/helenn/logs/keshav_ultra_20260331/bs4-siddharthfix1.out
 #SBATCH --exclusive
 
 # =============================================================================

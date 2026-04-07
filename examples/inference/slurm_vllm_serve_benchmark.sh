@@ -5,10 +5,10 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --segment=4
-#SBATCH --time=01:00:00
+#SBATCH --time=03:00:00
 #SBATCH --job-name=llmservice-vllm-serve
-#SBATCH --output=/lustre/fsw/portfolios/llmservice/users/helenn/logs/vllm-serve.out
-#SBATCH --error=/lustre/fsw/portfolios/llmservice/users/helenn/logs/vllm-serve.out
+#SBATCH --output=/lustre/fsw/portfolios/llmservice/users/helenn/logs/vllm-serve-4node-tp4dp4ep16-is8192-os65536-bs128.out
+#SBATCH --error=/lustre/fsw/portfolios/llmservice/users/helenn/logs/vllm-serve-4node-tp4dp4ep16-is8192-os65536-bs128.out
 #SBATCH --exclusive
 
 # =============================================================================
@@ -90,7 +90,7 @@ srun \
         fi
 
         echo "$HEAD_IP" > "$HEAD_IP_FILE"
-        echo "=== [rank0] Starting Ray head on ${HEAD_IP}:${RAY_PORT} ==="
+        echo "[$(date +%H:%M:%S)] Starting Ray head on ${HEAD_IP}:${RAY_PORT}"
         ray start --head --node-ip-address="${HEAD_IP}" --port="${RAY_PORT}" --disable-usage-stats
 
         # Wait for all workers to join
@@ -99,7 +99,7 @@ srun \
         for i in $(seq 1 120); do
             AVAILABLE=$(python3 -c "import ray; ray.init(address=\"auto\"); print(int(ray.cluster_resources().get(\"GPU\", 0)))" 2>/dev/null || echo 0)
             if [ "$AVAILABLE" -ge "$EXPECTED_GPUS" ]; then
-                echo "Ray cluster ready: $AVAILABLE GPUs available"
+                echo "[$(date +%H:%M:%S)] Ray cluster ready: $AVAILABLE GPUs available"
                 break
             fi
             if [ "$i" -eq 120 ]; then
@@ -110,7 +110,7 @@ srun \
             sleep 2
         done
 
-        echo "=== [rank0] Starting vLLM server (TP=${TP_SIZE}, DP=${DP_SIZE}) ==="
+        echo "[$(date +%H:%M:%S)] Starting vLLM server (TP=${TP_SIZE}, DP=${DP_SIZE})"
         LOG_FILE="/tmp/vllm_serve_${SLURM_JOB_ID}.log"
 
         vllm serve "${MODEL_PATH}" \
@@ -152,11 +152,11 @@ srun \
         done
 
         echo ""
-        echo "=== Server is ready on http://${HEAD_IP}:${SERVE_PORT} ==="
+        echo "[$(date +%H:%M:%S)] Server is ready on http://${HEAD_IP}:${SERVE_PORT}"
         echo ""
 
         # Run benchmark
-        echo "Running benchmark: batch=$BATCH_SIZE  ISL=$NUM_INPUT_TOKENS  OSL=$NUM_OUTPUT_TOKENS"
+        echo "[$(date +%H:%M:%S)] Running benchmark: batch=$BATCH_SIZE  ISL=$NUM_INPUT_TOKENS  OSL=$NUM_OUTPUT_TOKENS"
         python "${SCRIPT_DIR}/run_vllm_serve_benchmark.py" \
             --url "http://localhost:${SERVE_PORT}" \
             --model "${MODEL_PATH}" \
@@ -165,7 +165,7 @@ srun \
             --num-output-tokens "${NUM_OUTPUT_TOKENS}"
 
         # Shutdown
-        echo "Shutting down server..."
+        echo "[$(date +%H:%M:%S)] Benchmark complete. Shutting down server..."
         kill "$VLLM_PID" 2>/dev/null || true
         kill "$TAIL_PID" 2>/dev/null || true
         wait "$VLLM_PID" 2>/dev/null || true
