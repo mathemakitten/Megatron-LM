@@ -357,6 +357,68 @@ class TextGenerationController:
 
         return sampled_logits
 
+    @staticmethod
+    @torch.compile(dynamic=True)
+    def _compiled_logit_filter(
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
+        max_k: int,
+        apply_top_p: bool,
+    ) -> torch.Tensor:
+        """Compiled logit filtering: temperature scaling, top-k masking, top-p masking.
+
+        Factored out of _vectorized_sampling_func so torch.compile can fuse the
+        intermediate ops (clone, div, topk, gather, sort, cumsum, scatter, masked_fill)
+        into fewer GPU kernels. The multinomial call stays in eager because
+        torch.compile does not support the `generator` argument.
+
+        Args:
+            logits: [batch_size, vocab_size] raw logits.
+            temperatures: [batch_size] per-row temperature.
+            top_ks: [batch_size] per-row top-k (int32). 0 = no top-k, 1 = greedy.
+            top_ps: [batch_size] per-row top-p (float32). 0.0 = no top-p.
+            max_k: Maximum top-k value across the batch (already resolved on CPU).
+            apply_top_p: Whether any row uses top-p (already resolved on CPU).
+
+        Returns:
+            Filtered logits suitable for softmax + multinomial.
+        """
+        batch_size, vocab_size = logits.shape
+        logits = logits.clone()
+
+        # Temperature scaling.
+        logits.div_(temperatures.unsqueeze(1))
+
+        # Top-k filtering.
+        if max_k > 1 and max_k < vocab_size:
+            effective_k = torch.where(top_ks > 1, top_ks, vocab_size).long()
+            topk_values, _ = torch.topk(logits, k=max_k, dim=-1)
+            threshold_indices = (effective_k - 1).clamp(max=max_k - 1)
+            thresholds = topk_values.gather(1, threshold_indices.unsqueeze(1))
+            topk_mask = logits < thresholds
+            no_topk = (effective_k >= vocab_size).unsqueeze(1)
+            topk_mask.masked_fill_(no_topk, False)
+            logits.masked_fill_(topk_mask, float("-inf"))
+
+        # Top-p (nucleus) filtering.
+        if apply_top_p:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+
+            filter_ = cumulative_probs > top_ps.unsqueeze(1)
+            filter_[:, 0] = False
+            filter_[:, 1:] = filter_[:, :-1].clone()
+            filter_[:, 0] = False
+
+            filter_ = filter_.scatter(1, sorted_indices, filter_)
+            has_top_p = top_ps > 0.0
+            filter_.masked_fill_(~has_top_p.unsqueeze(1), False)
+            logits.masked_fill_(filter_, float("-inf"))
+
+        return logits
+
     def _vectorized_sampling_func(
         self,
         logits: torch.Tensor,
@@ -408,51 +470,21 @@ class TextGenerationController:
                 return self._torch_sampling_func(logits, temp_min, topk_max, top_p_min)
 
         # --- General vectorized path for heterogeneous batches ---
-        logits = logits.clone()
-
-        # Temperature scaling.
-        logits.div_(temperatures.unsqueeze(1))
-
-        # Top-k filtering (only rows with top_k > 1).
-        if topk_max > 1:
-            effective_k = torch.where(top_ks > 1, top_ks, vocab_size).long()
-            max_k = topk_max if topk_min > 1 else effective_k.max().item()
-            if max_k < vocab_size:
-                topk_values, _ = torch.topk(logits, k=max_k, dim=-1)
-                threshold_indices = (effective_k - 1).clamp(max=max_k - 1)
-                thresholds = topk_values.gather(1, threshold_indices.unsqueeze(1))
-                topk_mask = logits < thresholds
-                # Don't filter rows that don't use top-k.
-                no_topk = (effective_k >= vocab_size).unsqueeze(1)
-                topk_mask.masked_fill_(no_topk, False)
-                logits.masked_fill_(topk_mask, float("-inf"))
-
-        # Top-p (nucleus) filtering — only when at least one row needs it.
-        if any_top_p:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-            cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
-
-            filter_ = cumulative_probs > top_ps.unsqueeze(1)
-            filter_[:, 0] = False
-            # Shift right by 1 (matches original nucleus implementation).
-            filter_[:, 1:] = filter_[:, :-1].clone()
-            filter_[:, 0] = False
-
-            filter_ = filter_.scatter(1, sorted_indices, filter_)
-            # Only apply to rows that actually use top-p.
-            has_top_p = top_ps > 0.0
-            filter_.masked_fill_(~has_top_p.unsqueeze(1), False)
-            logits.masked_fill_(filter_, float("-inf"))
+        # The compiled filter fuses clone + div + topk + sort + masking into fewer kernels.
+        max_k = topk_max if topk_min > 1 else top_ks.max().item()
+        logits = self._compiled_logit_filter(
+            logits, temperatures, top_ks, top_ps, max_k, any_top_p
+        )
 
         # Sampling — split greedy vs non-greedy to avoid running multinomial
-        # on rows that only need argmax.
+        # on rows that only need argmax. multinomial stays in eager because
+        # torch.compile doesn't support the generator argument.
         if topk_min == 1:
             # Mixed batch: some greedy, some not.
             greedy_mask = top_ks == 1
             sampled = logits.argmax(dim=-1)
             # Only run softmax + multinomial on non-greedy rows.
-            non_greedy = ~greedy_mask
-            non_greedy_indices = non_greedy.nonzero(as_tuple=True)[0]
+            non_greedy_indices = (~greedy_mask).nonzero(as_tuple=True)[0]
             probabilities = logits[non_greedy_indices].softmax(dim=-1)
             sampled[non_greedy_indices] = torch.multinomial(
                 probabilities, num_samples=1, generator=self.sampling_rng
@@ -1398,8 +1430,11 @@ class TextGenerationController:
             # Gather: [num_decode, num_spec+1]
             gathered_log_probs = decode_log_probs.gather(2, gather_tokens.unsqueeze(-1)).squeeze(-1)
 
+            # Single CPU transfer instead of per-request .item() calls.
+            accepted_counts_cpu = accepted_counts.cpu()
+            gathered_cpu = gathered_log_probs.cpu()
             log_probs_list_decode = [
-                gathered_log_probs[i, : accepted_counts[i].item() + 1].tolist()
+                gathered_cpu[i, : accepted_counts_cpu[i].item() + 1].tolist()
                 for i in range(num_decode_requests)
             ]
 
@@ -1416,7 +1451,7 @@ class TextGenerationController:
                 selected_log_probs = prefill_log_probs[
                     torch.arange(num_prefill_requests, device=logits.device), prefill_new_tokens
                 ]
-                log_probs_list_prefill = [[lp.item()] for lp in selected_log_probs]
+                log_probs_list_prefill = [[lp] for lp in selected_log_probs.cpu().tolist()]
             else:
                 prefill_token_ids = context.token_to_input_ids[
                     decode_len : context.active_token_count
@@ -1494,10 +1529,14 @@ class TextGenerationController:
                 topk_values_cpu = topk_results.values.cpu()
                 topk_indices_cpu = topk_results.indices.cpu()
 
+                # Batch CPU transfers for loop metadata.
+                top_n_cpu = top_n_per_request.cpu()
+                accepted_counts_cpu = accepted_counts.cpu()
+
                 for i in range(num_decode_requests):
-                    top_n = int(top_n_per_request[i].item())
+                    top_n = int(top_n_cpu[i].item())
                     if top_n > 0:
-                        num_valid = accepted_counts[i].item() + 1
+                        num_valid = int(accepted_counts_cpu[i].item()) + 1
                         top_n_results[i] = [
                             (topk_values_cpu[i, j, :top_n], topk_indices_cpu[i, j, :top_n])
                             for j in range(num_valid)
@@ -1588,63 +1627,65 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
+        # Single CPU transfer for per-request metadata used in both branches.
+        top_n_per_request_cpu = (
+            self._request_metadata["top_n_logprobs"][active_request_slice]
+            [:active_request_count].cpu()
+        )
+
         # Handle decode-only mode (only last token)
         if context.config.materialize_only_last_token_logits or context.is_decode_only():
-            # In decode mode or when only last token logits are materialized,
-            # logits already represent only the last tokens
             log_probs = log_probs_tensor[:active_request_count]
+
+            max_top_n = int(top_n_per_request_cpu.max().item())
+            if max_top_n == 0:
+                return None
+
+            # Single batched topk on GPU, single CPU transfer.
+            topk_results = torch.topk(log_probs, k=max_top_n, dim=-1)
+            topk_values_cpu = topk_results.values.cpu()
+            topk_indices_cpu = topk_results.indices.cpu()
 
             top_n_results = {}
             for req_idx in range(active_request_count):
-                top_n = int(
-                    self._request_metadata["top_n_logprobs"][active_request_slice][req_idx].item()
-                )
+                top_n = int(top_n_per_request_cpu[req_idx].item())
                 if top_n > 0:
-                    # Get top-n logprobs and indices for this request (single token)
-                    top_n_logits = torch.topk(log_probs[req_idx], k=top_n)
                     top_n_results[req_idx] = [
-                        (top_n_logits.values.cpu(), top_n_logits.indices.cpu())
+                        (topk_values_cpu[req_idx, :top_n], topk_indices_cpu[req_idx, :top_n])
                     ]
             return top_n_results if top_n_results else None
 
         # Handle prefill mode - need to extract top-n for tokens per request
-        # This follows the same pattern as calculate_log_probs in dynamic_context.py
-        # Note: logits may be padded, so we only take the first active_token_count tokens
         log_probs = log_probs_tensor[: context.active_token_count]
 
         active_query_lengths = context.request_query_lengths[active_request_slice]
-
-        # Split log_probs across request boundaries
-        # log_probs has shape [active_token_count, vocab_size]
         log_probs_per_request = log_probs.split(active_query_lengths.tolist(), dim=0)
+
+        skip_prompt_cpu = (
+            self._request_metadata["skip_prompt_log_probs"][:active_request_count].cpu()
+        )
 
         top_n_results = {}
         for req_idx in range(active_request_count):
-            top_n = int(
-                self._request_metadata["top_n_logprobs"][active_request_slice][req_idx].item()
-            )
+            top_n = int(top_n_per_request_cpu[req_idx].item())
             if top_n > 0:
-                request_log_probs = log_probs_per_request[
-                    req_idx
-                ]  # [num_tokens_for_request, vocab_size]
-                skip_prompt = bool(self._request_metadata["skip_prompt_log_probs"][req_idx].item())
+                request_log_probs = log_probs_per_request[req_idx]
+                skip_prompt = bool(skip_prompt_cpu[req_idx].item())
 
-                # If skip_prompt_log_probs is True, only compute for last token
                 if skip_prompt and request_log_probs.size(0) > 1:
-                    # Only compute top-n for the last token (first generated token)
                     top_n_logits = torch.topk(request_log_probs[-1], k=top_n)
                     top_n_results[req_idx] = [
                         (top_n_logits.values.cpu(), top_n_logits.indices.cpu())
                     ]
                 else:
-                    # Compute top-n for all tokens in the request
-                    top_n_per_token = []
-                    for token_idx in range(request_log_probs.size(0)):
-                        top_n_logits = torch.topk(request_log_probs[token_idx], k=top_n)
-                        top_n_per_token.append(
-                            (top_n_logits.values.cpu(), top_n_logits.indices.cpu())
-                        )
-                    top_n_results[req_idx] = top_n_per_token
+                    # Batched topk across all tokens for this request, single transfer.
+                    top_n_logits = torch.topk(request_log_probs, k=top_n, dim=-1)
+                    topk_vals_cpu = top_n_logits.values.cpu()
+                    topk_idxs_cpu = top_n_logits.indices.cpu()
+                    top_n_results[req_idx] = [
+                        (topk_vals_cpu[t], topk_idxs_cpu[t])
+                        for t in range(request_log_probs.size(0))
+                    ]
 
         return top_n_results if top_n_results else None
 
