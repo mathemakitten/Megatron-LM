@@ -1123,8 +1123,16 @@ class TestTextGenerationController:
                 return torch.zeros((12,), dtype=torch.long, device='cuda')
 
         # Override sampling to return our predictable mock outputs
-        self.text_generation_controller._torch_sampling_buckets = [([0, 1], 1.0, 1, 0.0)]
-        self.text_generation_controller._torch_sampling_func = mock.MagicMock(
+        self.text_generation_controller._active_temperatures = torch.tensor(
+            [1.0, 1.0], device='cuda'
+        )
+        self.text_generation_controller._active_top_ks = torch.tensor(
+            [1, 1], dtype=torch.int32, device='cuda'
+        )
+        self.text_generation_controller._active_top_ps = torch.tensor(
+            [0.0, 0.0], device='cuda'
+        )
+        self.text_generation_controller._vectorized_sampling_func = mock.MagicMock(
             side_effect=mock_sampling_func
         )
 
@@ -1248,12 +1256,19 @@ class TestTextGenerationController:
         # Base logits shape: [1, 8, vocab_size]
         logits = torch.randn(1, 8, self.vocab_size, device='cuda')
 
-        # Set up a bucket that forces multinomial sampling (top_p = 0.9, top_k = 0)
-        # _torch_sampling_buckets format: (indices, temp, top_k, top_p)
-        self.text_generation_controller._torch_sampling_buckets = [([0, 1], 1.0, 0, 0.9)]
+        # Set up per-request sampling params that force multinomial sampling (top_p = 0.9, top_k = 0)
+        self.text_generation_controller._active_temperatures = torch.tensor(
+            [1.0, 1.0], device='cuda'
+        )
+        self.text_generation_controller._active_top_ks = torch.tensor(
+            [0, 0], dtype=torch.int32, device='cuda'
+        )
+        self.text_generation_controller._active_top_ps = torch.tensor(
+            [0.9, 0.9], device='cuda'
+        )
 
-        # Since we are actually testing the internal math of `_torch_sampling_func` handling the shapes,
-        # we DO NOT mock `_torch_sampling_func` here. We want it to run natively to prove it doesn't crash.
+        # We DO NOT mock _vectorized_sampling_func here. We want it to run natively to prove
+        # it doesn't crash with the real tensor shapes.
 
         try:
             self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(
@@ -1487,7 +1502,11 @@ class TestTextGenerationController:
         ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
 
         # Greedy sampling: top_k=1 selects the argmax token deterministically.
-        ctrl._torch_sampling_buckets = [(list(range(active_request_count)), 1.0, 1, 0.0)]
+        ctrl._active_temperatures = torch.ones(active_request_count, device='cuda')
+        ctrl._active_top_ks = torch.ones(
+            active_request_count, dtype=torch.int32, device='cuda'
+        )
+        ctrl._active_top_ps = torch.zeros(active_request_count, device='cuda')
 
         # Run the MTP forward pass
         ctrl._compute_serial_mtp_and_sample()
