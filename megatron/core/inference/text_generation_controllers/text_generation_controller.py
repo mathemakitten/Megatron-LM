@@ -367,7 +367,8 @@ class TextGenerationController:
         """Vectorized sampling across a batch with per-row temperature, top-k, and top-p.
 
         Handles all three sampling modes (greedy, top-k, top-p) in a single
-        batched call with no Python loops or CPU-GPU synchronization.
+        batched call. Uses cheap scalar syncs to skip expensive operations
+        (sort, multinomial) when the batch composition allows it.
 
         Args:
             logits (torch.Tensor): Shape [batch_size, vocab_size].
@@ -382,71 +383,86 @@ class TextGenerationController:
         """
         batch_size, vocab_size = logits.shape
 
-        # Work on a copy — we modify in-place below.
+        # Compute batch composition with a single fused reduction.
+        # min/max of top_ks tells us: all greedy (max==1), any greedy (min==1),
+        # any top-k filtering (max>1), and the max k needed.
+        topk_min = top_ks.min().item()
+        topk_max = top_ks.max().item()
+        any_top_p = (top_ps > 0.0).any().item()
+
+        # --- Fast path: entire batch is greedy ---
+        if topk_max == 1:
+            return logits.argmax(dim=-1)
+
+        # --- Fast path: entire batch uses same scalar params ---
+        # When min == max for top_k the batch is homogeneous in k.
+        # Combined with a single top_p check we can dispatch the scalar path.
+        if topk_min == topk_max and not any_top_p:
+            return self._torch_sampling_func(logits, temperatures[0].item(), topk_max, 0.0)
+        if topk_min == topk_max and any_top_p:
+            top_p_min = top_ps.min().item()
+            top_p_max = top_ps.max().item()
+            temp_min = temperatures.min().item()
+            temp_max = temperatures.max().item()
+            if top_p_min == top_p_max and temp_min == temp_max:
+                return self._torch_sampling_func(logits, temp_min, topk_max, top_p_min)
+
+        # --- General vectorized path for heterogeneous batches ---
         logits = logits.clone()
 
-        # --- Temperature scaling (vectorized, skip rows where temp == 1.0) ---
-        # Unsqueeze to [B, 1] for broadcasting across vocab dimension.
-        temp = temperatures.unsqueeze(1)
-        # Avoid division for temp==1 rows (no-op), but the branch-free version
-        # is simpler and lets torch.compile fuse everything.
-        logits.div_(temp)
+        # Temperature scaling.
+        logits.div_(temperatures.unsqueeze(1))
 
-        # --- Top-k filtering (vectorized across rows) ---
-        # For rows with top_k > 1, keep only the top_k logits.
-        # For rows with top_k <= 1 (greedy or no top-k), use vocab_size so nothing is filtered.
-        effective_k = torch.where(top_ks > 1, top_ks, vocab_size).long()
+        # Top-k filtering (only rows with top_k > 1).
+        if topk_max > 1:
+            effective_k = torch.where(top_ks > 1, top_ks, vocab_size).long()
+            max_k = topk_max if topk_min > 1 else effective_k.max().item()
+            if max_k < vocab_size:
+                topk_values, _ = torch.topk(logits, k=max_k, dim=-1)
+                threshold_indices = (effective_k - 1).clamp(max=max_k - 1)
+                thresholds = topk_values.gather(1, threshold_indices.unsqueeze(1))
+                topk_mask = logits < thresholds
+                # Don't filter rows that don't use top-k.
+                no_topk = (effective_k >= vocab_size).unsqueeze(1)
+                topk_mask.masked_fill_(no_topk, False)
+                logits.masked_fill_(topk_mask, float("-inf"))
 
-        # Use the max effective_k for the batched topk call. Rows that don't need
-        # top-k filtering request vocab_size, which is a no-op (keeps everything).
-        max_k = effective_k.max().item()
-        if max_k < vocab_size:
-            # Batched topk with the largest k needed.
-            topk_values, _ = torch.topk(logits, k=max_k, dim=-1)
-            # Per-row threshold: the k-th largest value for each row's own k.
-            # effective_k - 1 indexes into the sorted topk results.
-            # Clamp to max_k-1 for rows that have effective_k == vocab_size.
-            threshold_indices = (effective_k - 1).clamp(max=max_k - 1)
-            thresholds = topk_values.gather(1, threshold_indices.unsqueeze(1))
-            # Mask out logits below each row's threshold.
-            topk_mask = logits < thresholds
-            # Don't filter rows that have no top-k (effective_k == vocab_size).
-            no_topk = (effective_k >= vocab_size).unsqueeze(1)
-            topk_mask.masked_fill_(no_topk, False)
-            logits.masked_fill_(topk_mask, float("-inf"))
-
-        # --- Top-p (nucleus) filtering (vectorized across rows) ---
-        has_top_p = top_ps > 0.0
-        if has_top_p.any():
+        # Top-p (nucleus) filtering — only when at least one row needs it.
+        if any_top_p:
             sorted_logits, sorted_indices = torch.sort(logits, descending=True)
             cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
 
-            # Standard nucleus shift: keep at least the top-1 token.
             filter_ = cumulative_probs > top_ps.unsqueeze(1)
             filter_[:, 0] = False
-            # Shift right by 1 (same as the original implementation).
+            # Shift right by 1 (matches original nucleus implementation).
             filter_[:, 1:] = filter_[:, :-1].clone()
             filter_[:, 0] = False
 
-            # Scatter back to original vocab order and apply.
             filter_ = filter_.scatter(1, sorted_indices, filter_)
             # Only apply to rows that actually use top-p.
+            has_top_p = top_ps > 0.0
             filter_.masked_fill_(~has_top_p.unsqueeze(1), False)
             logits.masked_fill_(filter_, float("-inf"))
 
-        # --- Sample ---
-        probabilities = logits.softmax(dim=-1)
-        sampled = torch.multinomial(probabilities, num_samples=1, generator=self.sampling_rng).view(
-            -1
-        )
-
-        # --- Greedy override: for top_k == 1, ignore the multinomial result ---
-        greedy_mask = top_ks == 1
-        if greedy_mask.any():
-            # argmax on the *temperature-scaled* logits is equivalent to argmax
-            # on the original logits (monotonic transform), so this is correct.
-            greedy_tokens = logits.argmax(dim=-1)
-            sampled = torch.where(greedy_mask, greedy_tokens, sampled)
+        # Sampling — split greedy vs non-greedy to avoid running multinomial
+        # on rows that only need argmax.
+        if topk_min == 1:
+            # Mixed batch: some greedy, some not.
+            greedy_mask = top_ks == 1
+            sampled = logits.argmax(dim=-1)
+            # Only run softmax + multinomial on non-greedy rows.
+            non_greedy = ~greedy_mask
+            non_greedy_indices = non_greedy.nonzero(as_tuple=True)[0]
+            probabilities = logits[non_greedy_indices].softmax(dim=-1)
+            sampled[non_greedy_indices] = torch.multinomial(
+                probabilities, num_samples=1, generator=self.sampling_rng
+            ).view(-1)
+        else:
+            # No greedy rows — multinomial on entire batch.
+            probabilities = logits.softmax(dim=-1)
+            sampled = torch.multinomial(
+                probabilities, num_samples=1, generator=self.sampling_rng
+            ).view(-1)
 
         return sampled
 
