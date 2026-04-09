@@ -7,8 +7,8 @@
 #SBATCH --segment=4
 #SBATCH --time=03:00:00
 #SBATCH --job-name=llmservice-vllm-serve
-#SBATCH --output=/lustre/fsw/portfolios/llmservice/users/helenn/logs/vllm-serve-4node-tp4dp4ep16-is8192-os65536-bs128.out
-#SBATCH --error=/lustre/fsw/portfolios/llmservice/users/helenn/logs/vllm-serve-4node-tp4dp4ep16-is8192-os65536-bs128.out
+#SBATCH --output=/lustre/fsw/portfolios/llmservice/users/helenn/logs/vllm/vllm-serve-4node-tp4dp4ep16-is8192-os65536-bs4.out
+#SBATCH --error=/lustre/fsw/portfolios/llmservice/users/helenn/logs/vllm/vllm-serve-4node-tp4dp4ep16-is8192-os65536-bs4.out
 #SBATCH --exclusive
 
 # =============================================================================
@@ -157,7 +157,7 @@ srun \
 
         # Run benchmark
         echo "[$(date +%H:%M:%S)] Running benchmark: batch=$BATCH_SIZE  ISL=$NUM_INPUT_TOKENS  OSL=$NUM_OUTPUT_TOKENS"
-        python "${SCRIPT_DIR}/run_vllm_serve_benchmark.py" \
+        python "${SCRIPT_DIR}/run_vllm_serve_benchmark_old.py" \
             --url "http://localhost:${SERVE_PORT}" \
             --model "${MODEL_PATH}" \
             --batch-size "${BATCH_SIZE}" \
