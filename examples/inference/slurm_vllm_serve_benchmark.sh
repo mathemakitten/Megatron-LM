@@ -5,10 +5,10 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --segment=4
-#SBATCH --time=03:00:00
+#SBATCH --time=00:29:00
 #SBATCH --job-name=llmservice-vllm-serve
-#SBATCH --output=/lustre/fsw/portfolios/llmservice/users/helenn/logs/vllm/vllm-serve-4node-tp4dp4ep16-is8192-os65536-bs4.out
-#SBATCH --error=/lustre/fsw/portfolios/llmservice/users/helenn/logs/vllm/vllm-serve-4node-tp4dp4ep16-is8192-os65536-bs4.out
+#SBATCH --output=/lustre/fsw/portfolios/llmservice/users/helenn/logs/vllm/vllm-serve-4node-tp4dp4ep16-is8192-os65536-flashinfer-bs4.out
+#SBATCH --error=/lustre/fsw/portfolios/llmservice/users/helenn/logs/vllm/vllm-serve-4node-tp4dp4ep16-is8192-os65536-flashinfer-bs4.out
 #SBATCH --exclusive
 
 # =============================================================================
@@ -25,7 +25,7 @@ set -euo pipefail
 
 # --------------- configuration (override via env) ----------------------------
 MODEL_PATH="${MODEL_PATH:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nemotron_ultra/nemo_rl/ci/checkpoints/ultra-v3-sft-hsg-mainfeb19merge-mxfp8_fixed-hf_converted}"
-CONTAINER_IMAGE="${CONTAINER_IMAGE:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/helenn/docker/vllm-hsg-nightly.sqsh}"
+CONTAINER_IMAGE="${CONTAINER_IMAGE:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/helenn/docker/vllm-hsg-20260413.sqsh}"
 CONTAINER_MOUNTS="${CONTAINER_MOUNTS:-/lustre:/lustre,/home:/home}"
 SCRIPT_DIR="${SCRIPT_DIR:-/lustre/fsw/portfolios/llmservice/users/${USER}/megatron-lm/examples/inference}"
 

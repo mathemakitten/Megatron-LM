@@ -27,7 +27,7 @@ set -euo pipefail
 
 # --------------- configuration (override via env) ----------------------------
 MODEL_PATH="${MODEL_PATH:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nemotron_ultra/nemo_rl/ci/checkpoints/ultra-v3-sft-hsg-mainfeb19merge-mxfp8_fixed-hf_converted}"
-CONTAINER_IMAGE="${CONTAINER_IMAGE:-/lustre/fsw/portfolios/llmservice/projects/llmservice_fm_text/users/helenn/docker/vllm-hsg-nightly.sqsh}"
+CONTAINER_IMAGE="${CONTAINER_IMAGE:-/lustre/fsw/portfolios/llmservice/projects/llmservice_fm_text/users/helenn/docker/vllm-hsg-20260413.sqsh}"
 CONTAINER_MOUNTS="${CONTAINER_MOUNTS:-/lustre:/lustre,/home:/home}"
 SCRIPT_DIR="${SCRIPT_DIR:-/lustre/fsw/portfolios/llmservice/users/${USER}/megatron-lm/examples/inference}"
 
@@ -81,6 +81,9 @@ srun \
     export TRITON_CACHE_DIR="/tmp/triton_cache_${SLURM_JOB_ID}_rank${SLURM_PROCID}"
     mkdir -p "$TRITON_CACHE_DIR"
 
+    # Disable symmetric memory for allreduce — incompatible with nsys profiling
+    export VLLM_ALLREDUCE_USE_SYMM_MEM=0
+
     HEAD_IP_FILE="/lustre/fsw/portfolios/llmservice/users/helenn/tmp/.ray_head_ip_${SLURM_JOB_ID}"
 
     if [ "$SLURM_PROCID" -eq 0 ]; then
@@ -98,8 +101,32 @@ srun \
         fi
 
         echo "$HEAD_IP" > "$HEAD_IP_FILE"
-        echo "[$(date +%H:%M:%S)] Starting Ray head on ${HEAD_IP}:${RAY_PORT}"
-        ray start --head --node-ip-address="${HEAD_IP}" --port="${RAY_PORT}" --disable-usage-stats
+
+        # Start Ray head under nsys so GPU workers (spawned by raylet)
+        # are in the profiled process tree
+        echo "[$(date +%H:%M:%S)] Starting Ray head under nsys on ${HEAD_IP}:${RAY_PORT}"
+        nsys profile \
+            --trace=cuda,nvtx,osrt \
+            --cuda-graph-trace=node \
+            --sample=none \
+            --output="${PROFILE_DIR}/${PROFILE_NAME}" \
+            --force-overwrite=true \
+            --trace-fork-before-exec=true \
+            -- \
+            ray start --head --block \
+                --node-ip-address="${HEAD_IP}" \
+                --port="${RAY_PORT}" \
+                --disable-usage-stats &
+        NSYS_PID=$!
+
+        # Wait for Ray head to be up
+        echo "Waiting for Ray head..."
+        for i in $(seq 1 60); do
+            if ray status --address "${HEAD_IP}:${RAY_PORT}" >/dev/null 2>&1; then
+                break
+            fi
+            sleep 2
+        done
 
         # Wait for all workers to join
         EXPECTED_GPUS=$(( SLURM_JOB_NUM_NODES * GPUS_PER_NODE ))
@@ -118,39 +145,32 @@ srun \
             sleep 2
         done
 
-        echo "[$(date +%H:%M:%S)] Starting vLLM server under nsys (TP=${TP_SIZE}, DP=${DP_SIZE})"
+        echo "[$(date +%H:%M:%S)] Starting vLLM server (TP=${TP_SIZE}, DP=${DP_SIZE})"
         LOG_FILE="/tmp/vllm_serve_${SLURM_JOB_ID}.log"
 
         # Disabled: FlashInfer MoE not compatible with this container version
         # export VLLM_USE_FLASHINFER_MOE_FP16=1
         # export VLLM_FLASHINFER_MOE_BACKEND=latency
 
-        nsys profile \
-            --trace=cuda,nvtx,osrt \
-            --cuda-graph-trace=node \
-            --sample=none \
-            --output="${PROFILE_DIR}/${PROFILE_NAME}" \
-            --force-overwrite=true \
-            -- \
-            vllm serve "${MODEL_PATH}" \
-                --host 0.0.0.0 \
-                --port "${SERVE_PORT}" \
-                --tensor-parallel-size "${TP_SIZE}" \
-                --pipeline-parallel-size "${PP_SIZE}" \
-                --distributed-executor-backend ray \
-                --data-parallel-size "${DP_SIZE}" \
-                --data-parallel-backend ray \
-                --data-parallel-address "${HEAD_IP}" \
-                --data-parallel-size-local 1 \
-                --enable-expert-parallel \
-                --enable-chunked-prefill \
-                --dtype bfloat16 \
-                --trust-remote-code \
-                --max-model-len "${MAX_MODEL_LEN}" \
-                --gpu-memory-utilization 0.9 \
-                --compilation-config "{\"pass_config\": {\"fuse_allreduce_rms\": false}}" \
-                > "${LOG_FILE}" 2>&1 &
-        NSYS_PID=$!
+        vllm serve "${MODEL_PATH}" \
+            --host 0.0.0.0 \
+            --port "${SERVE_PORT}" \
+            --tensor-parallel-size "${TP_SIZE}" \
+            --pipeline-parallel-size "${PP_SIZE}" \
+            --distributed-executor-backend ray \
+            --data-parallel-size "${DP_SIZE}" \
+            --data-parallel-backend ray \
+            --data-parallel-address "${HEAD_IP}" \
+            --data-parallel-size-local 1 \
+            --enable-expert-parallel \
+            --enable-chunked-prefill \
+            --dtype bfloat16 \
+            --trust-remote-code \
+            --max-model-len "${MAX_MODEL_LEN}" \
+            --gpu-memory-utilization 0.9 \
+            --compilation-config "{\"pass_config\": {\"fuse_allreduce_rms\": false}}" \
+            > "${LOG_FILE}" 2>&1 &
+        VLLM_PID=$!
 
         # Tail log so output appears in SLURM log
         tail -f "${LOG_FILE}" &
@@ -162,7 +182,7 @@ srun \
             if grep -q -e "Uvicorn running on" -e "Application startup complete" "${LOG_FILE}" 2>/dev/null; then
                 break
             fi
-            if ! kill -0 "$NSYS_PID" 2>/dev/null; then
+            if ! kill -0 "$VLLM_PID" 2>/dev/null; then
                 echo "ERROR: server process died. Last 50 lines:"
                 tail -50 "${LOG_FILE}"
                 kill "$TAIL_PID" 2>/dev/null || true
@@ -177,34 +197,37 @@ srun \
         echo "[$(date +%H:%M:%S)] Server is ready on http://${HEAD_IP}:${SERVE_PORT}"
         echo ""
 
-        # Warmup: 1 request to trigger CUDA graphs etc.
+        # Warmup: trigger CUDA graphs etc.
         echo "[$(date +%H:%M:%S)] Sending warmup request..."
         python "${SCRIPT_DIR}/run_vllm_serve_benchmark.py" \
             --server-url "http://localhost:${SERVE_PORT}" \
             --model "${MODEL_PATH}" \
-            --batch-size 1 \
+            --batch-size "${DP_SIZE}" \
             --num-input-tokens "${NUM_INPUT_TOKENS}" \
             --num-output-tokens "${NUM_OUTPUT_TOKENS}" \
             --num-warmup-iters 1 \
             --num-iters 0
 
-        # Profiled request: single forward pass
+        # Profiled request
         echo "[$(date +%H:%M:%S)] Sending profiled request..."
         python "${SCRIPT_DIR}/run_vllm_serve_benchmark.py" \
             --server-url "http://localhost:${SERVE_PORT}" \
             --model "${MODEL_PATH}" \
-            --batch-size 1 \
+            --batch-size "${DP_SIZE}" \
             --num-input-tokens "${NUM_INPUT_TOKENS}" \
             --num-output-tokens "${NUM_OUTPUT_TOKENS}" \
             --num-warmup-iters 0 \
             --num-iters 1
 
-        # Shutdown — killing the server causes nsys to finalize the profile
-        echo "[$(date +%H:%M:%S)] Request complete. Shutting down server..."
-        kill "$NSYS_PID" 2>/dev/null || true
+        # Shutdown server, then Ray (triggers nsys to write profile)
+        echo "[$(date +%H:%M:%S)] Request complete. Shutting down..."
+        kill "$VLLM_PID" 2>/dev/null || true
         kill "$TAIL_PID" 2>/dev/null || true
-        wait "$NSYS_PID" 2>/dev/null || true
+        wait "$VLLM_PID" 2>/dev/null || true
+
+        # Stopping Ray causes nsys to finalize since it wraps "ray start --block"
         ray stop || true
+        wait "$NSYS_PID" 2>/dev/null || true
         rm -f "$HEAD_IP_FILE"
 
         echo "[$(date +%H:%M:%S)] Profile written to: ${PROFILE_DIR}/${PROFILE_NAME}.nsys-rep"
