@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH --partition=batch
 #SBATCH --account=llmservice_fm_text
-#SBATCH --nodes=4
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
-#SBATCH --segment=4
+#SBATCH --segment=2
 #SBATCH --time=03:00:00
 #SBATCH --job-name=llmservice-vllm-serve
-#SBATCH --output=/lustre/fsw/portfolios/llmservice/users/helenn/logs/vllm/vllm-realdata-flashinfer-tomermodel-bs32.out
-#SBATCH --error=/lustre/fsw/portfolios/llmservice/users/helenn/logs/vllm/vllm-realdata-flashinfer-tomermodel-bs32.out
+#SBATCH --output=/lustre/fsw/portfolios/llmservice/users/helenn/logs/vllm/vllm-realdata-flashinfer-2node-tp8ep8dp1-bs8.out
+#SBATCH --error=/lustre/fsw/portfolios/llmservice/users/helenn/logs/vllm/vllm-realdata-flashinfer-2node-tp8ep8dp1-bs8.out
 #SBATCH --exclusive
 
 # =============================================================================
@@ -31,6 +31,7 @@ REPO_DIR="${REPO_DIR:-/lustre/fsw/portfolios/llmservice/users/${USER}/megatron-l
 SCRIPT_DIR="${SCRIPT_DIR:-${REPO_DIR}/examples/inference}"
 
 GPUS_PER_NODE=4
+SERVE_PORT="${SERVE_PORT:-8000}"
 SERVE_PORT="${SERVE_PORT:-8000}"
 RAY_PORT="${RAY_PORT:-6379}"
 
@@ -119,22 +120,24 @@ srun \
         export VLLM_USE_FLASHINFER_MOE_FP16=1
         export VLLM_FLASHINFER_MOE_BACKEND=latency
 
+        DP_ARGS=""
+        if [ "${DP_SIZE}" -gt 1 ]; then
+            DP_ARGS="--data-parallel-size ${DP_SIZE} --data-parallel-backend ray --data-parallel-address ${HEAD_IP} --data-parallel-size-local 1"
+        fi
+
         vllm serve "${MODEL_PATH}" \
             --host 0.0.0.0 \
             --port "${SERVE_PORT}" \
             --tensor-parallel-size "${TP_SIZE}" \
             --pipeline-parallel-size "${PP_SIZE}" \
             --distributed-executor-backend ray \
-            --data-parallel-size "${DP_SIZE}" \
-            --data-parallel-backend ray \
-            --data-parallel-address "${HEAD_IP}" \
-            --data-parallel-size-local 1 \
+            ${DP_ARGS} \
             --enable-expert-parallel \
             --enable-chunked-prefill \
             --dtype bfloat16 \
             --trust-remote-code \
             --max-model-len "${MAX_MODEL_LEN}" \
-            --gpu-memory-utilization 0.95 \
+            --gpu-memory-utilization 0.9 \
             --compilation-config "{\"pass_config\": {\"fuse_allreduce_rms\": false}}" \
             > "${LOG_FILE}" 2>&1 &
         VLLM_PID=$!
