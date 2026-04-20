@@ -3074,7 +3074,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def calculate_log_probs(
         self, logits: Tensor, new_tokens: Tensor, only_last_token_logits: Optional[bool] = False
-    ) -> Tuple[List[List[float]], Tensor]:
+    ) -> Tuple[List[Tensor], Tensor]:
         """Calculate log probs for all active requests and return them.
 
         TODO: @wdykas support top-n log probs.
@@ -3085,8 +3085,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             only_last_token_logits (bool): If set, the logits are from only the last token in each request
 
         Returns:
-            List of lists where each inner list contains log probs for a request in the
-            same order as the active requests (from paused_request_count to total_request_count).
+            List of 1-D GPU tensors, one per active request (order: paused_request_count to
+            total_request_count), containing the selected log probs for tokens emitted this
+            step. Materialization to Python floats is deferred to request completion to avoid
+            a per-step device->host sync.
             log_probs (Tensor): Used to compute top n logprobs later if required.
         """
 
@@ -3097,7 +3099,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             seq_idx = torch.arange(len(new_tokens), dtype=torch.int32, device=logits.device)
             log_probs = F.log_softmax(logits_squeezed[seq_idx], dim=-1)
             selected_log_probs = log_probs[seq_idx, new_tokens]
-            return [[lp] for lp in selected_log_probs.tolist()], log_probs
+            return list(selected_log_probs.split(1, dim=0)), log_probs
 
         log_probs = F.log_softmax(logits_squeezed, dim=-1)
         # Get the selected token ids for all tokens.
@@ -3136,13 +3138,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         seq_idx = torch.arange(self.active_token_count, device=log_probs.device)
         selected_log_probs = log_probs[seq_idx, active_token_ids]
 
-        # Split the log probs across request boundaries
-        selected_log_probs_list = selected_log_probs.cpu().split(
+        # Split on-device into per-request 1-D tensor views. The split-size list
+        # requires one .tolist() sync on active_query_lengths, but we no longer
+        # copy selected_log_probs to host or materialize per-element floats.
+        selected_log_probs_list = selected_log_probs.split(
             active_query_lengths.tolist(), dim=0
         )
 
-        # Convert each log prob tensor into a list
-        return [lp.tolist() for lp in selected_log_probs_list], log_probs
+        return list(selected_log_probs_list), log_probs
 
     def get_kvcache_utilization_stats(self) -> dict:
         """Compute KV cache buffer utilization stats for the current step.

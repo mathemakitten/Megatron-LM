@@ -174,6 +174,9 @@ class InferenceRequest:
         # do not use asdict(self) - it has very high CPU overheads
         # and if there are tensors, it will try to deepcopy them
         obj = self.__dict__.copy()  # shallow dict copy
+        # Drop internal scratch state not meant for wire / disk.
+        obj.pop("_pending_prompt_lps", None)
+        obj.pop("_pending_generated_lps", None)
         obj["status"] = self.status.name if self.status else None
         obj["sampling_params"] = self.sampling_params.serialize() if self.sampling_params else None
         obj["inference_parameters"] = (

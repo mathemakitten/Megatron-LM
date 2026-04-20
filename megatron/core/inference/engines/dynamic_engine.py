@@ -1107,6 +1107,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 tokens = accepted_tokens + tokens
 
             num_stop_word_trim = 0
+            completed_entry_this_iter = None
             if request_id != self.context.chunked_prefill_request_id:
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
@@ -1191,7 +1192,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     finished_request = finished_entry.record[-1]
                     finished_request.generated_length = len(finished_request.generated_tokens)
                     finished_request_records.append(finished_entry.record)
-                    finished_entry.future.set_result(finished_entry.record)
+                    # NOTE: materialization of pending log_prob tensors and
+                    # future.set_result are deferred until after this step's
+                    # log_probs are appended below.
+                    completed_entry_this_iter = finished_entry
                 elif stop_word_hit:
                     # Stop word detected - mark for removal in next step's bookkeeping
                     # Don't pop yet; let the next step handle it properly via callback
@@ -1221,36 +1225,67 @@ class DynamicInferenceEngine(AbstractEngine):
                 request_log_probs is not None
                 and request_id not in self.stop_word_being_finished_ids
             ):
-                # Initialize lists if they don't exist
-                if not request.prompt_log_probs:
-                    request.prompt_log_probs = []
-                if not request.generated_log_probs:
-                    request.generated_log_probs = []
-
                 is_chunked_prefill = request_id == self.context.chunked_prefill_request_id
-                is_prefill = len(request.generated_log_probs) == 0
 
-                if request.sampling_params.skip_prompt_log_probs:
-                    # We only want decode log probs.
-                    if is_chunked_prefill:
-                        pass
-                    elif is_prefill:
-                        request.generated_log_probs.append(request_log_probs[-1])
+                if isinstance(request_log_probs, torch.Tensor):
+                    # Non-speculative path: accumulate GPU tensor chunks and materialize
+                    # once per request at completion to avoid a per-step host sync.
+                    if not hasattr(request, "_pending_prompt_lps"):
+                        request._pending_prompt_lps = []
+                        request._pending_generated_lps = []
+
+                    is_prefill = len(request._pending_generated_lps) == 0
+                    step_len = request_log_probs.size(0)
+
+                    if request.sampling_params.skip_prompt_log_probs:
+                        if is_chunked_prefill:
+                            pass
+                        elif is_prefill:
+                            request._pending_generated_lps.append(request_log_probs[-1:])
+                        else:
+                            request._pending_generated_lps.append(request_log_probs)
                     else:
-                        request.generated_log_probs.extend(request_log_probs)
-                else:
-                    # Split log probs between prompt and generated based on remaining prompt slots.
-                    prompt_length = len(request.prompt_tokens)
-                    total_accumulated = len(request.prompt_log_probs) + len(
-                        request.generated_log_probs
-                    )
-                    remaining_prompt_slots = max(0, prompt_length - 1 - total_accumulated)
-                    split_idx = min(remaining_prompt_slots, len(request_log_probs))
+                        prompt_length = len(request.prompt_tokens)
+                        total_accumulated = sum(
+                            t.size(0) for t in request._pending_prompt_lps
+                        ) + sum(t.size(0) for t in request._pending_generated_lps)
+                        remaining_prompt_slots = max(0, prompt_length - 1 - total_accumulated)
+                        split_idx = min(remaining_prompt_slots, step_len)
 
-                    if split_idx > 0:
-                        request.prompt_log_probs.extend(request_log_probs[:split_idx])
-                    if split_idx < len(request_log_probs):
-                        request.generated_log_probs.extend(request_log_probs[split_idx:])
+                        if split_idx > 0:
+                            request._pending_prompt_lps.append(request_log_probs[:split_idx])
+                        if split_idx < step_len:
+                            request._pending_generated_lps.append(
+                                request_log_probs[split_idx:]
+                            )
+                else:
+                    # Legacy list-of-floats path (speculative decoding still returns lists).
+                    if not request.prompt_log_probs:
+                        request.prompt_log_probs = []
+                    if not request.generated_log_probs:
+                        request.generated_log_probs = []
+
+                    is_prefill = len(request.generated_log_probs) == 0
+
+                    if request.sampling_params.skip_prompt_log_probs:
+                        if is_chunked_prefill:
+                            pass
+                        elif is_prefill:
+                            request.generated_log_probs.append(request_log_probs[-1])
+                        else:
+                            request.generated_log_probs.extend(request_log_probs)
+                    else:
+                        prompt_length = len(request.prompt_tokens)
+                        total_accumulated = len(request.prompt_log_probs) + len(
+                            request.generated_log_probs
+                        )
+                        remaining_prompt_slots = max(0, prompt_length - 1 - total_accumulated)
+                        split_idx = min(remaining_prompt_slots, len(request_log_probs))
+
+                        if split_idx > 0:
+                            request.prompt_log_probs.extend(request_log_probs[:split_idx])
+                        if split_idx < len(request_log_probs):
+                            request.generated_log_probs.extend(request_log_probs[split_idx:])
 
             # Process top_n_logprobs if available (unified for both regular and chunked prefill)
             # Same stop-word guard as log probs above.
@@ -1308,6 +1343,27 @@ class DynamicInferenceEngine(AbstractEngine):
                     request.routing_indices = torch.cat(
                         [request.routing_indices, step_routing], dim=0
                     )
+
+            # Finalize any request that completed this iteration. Done after
+            # all per-step accumulation so the final step's log_probs are
+            # included, and kept to a single device->host sync per request.
+            if completed_entry_this_iter is not None:
+                if hasattr(request, "_pending_prompt_lps"):
+                    request.prompt_log_probs = (
+                        torch.cat(request._pending_prompt_lps).tolist()
+                        if request._pending_prompt_lps
+                        else []
+                    )
+                    request.generated_log_probs = (
+                        torch.cat(request._pending_generated_lps).tolist()
+                        if request._pending_generated_lps
+                        else []
+                    )
+                    del request._pending_prompt_lps
+                    del request._pending_generated_lps
+                completed_entry_this_iter.future.set_result(
+                    completed_entry_this_iter.record
+                )
 
         # Handle evicted requests.
         if evict_request_ids is not None and evict_request_ids.numel() > 0:
