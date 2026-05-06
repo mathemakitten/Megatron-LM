@@ -691,6 +691,17 @@ class InferenceGroupedMLP(TEGroupedMLP):
         # handle.psum_num_recv_tokens_per_expert exactly.
         offs = tokens_per_expert.cumsum(0).to(torch.int32)
 
+        # PyTorch's CUTLASS grouped_mm (sm90/sm100 BF16) asserts
+        # offs[-1] == mat1.shape[0]. The recv buffer is sized to the worst-case
+        # `num_max_tokens_per_rank * num_ranks * num_topk` padded total, but
+        # offs[-1] only covers the actually-routed prefix. Extend the last
+        # expert's offset to cover the padding rows: the last expert then
+        # computes garbage over the pad slots, which combine() discards. This
+        # adds at most a small amount of wasted compute on padding rows and
+        # avoids the host-sync we'd need to slice the input down.
+        N_padded = permuted_local_hidden_states.shape[0]
+        offs[-1] = N_padded
+
         # FC1: input [N, hidden] @ weight^T → [N, ffn_hidden * (2 if gated else 1)]
         # _fc1_weight is [num_local_experts, ffn_hidden_out, hidden]; grouped_mm
         # wants [G, K, N], so transpose(1, 2).
