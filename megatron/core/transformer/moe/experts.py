@@ -656,6 +656,69 @@ class InferenceGroupedMLP(TEGroupedMLP):
         )
         return output, None
 
+    def _deepep_v2_expand_forward(
+        self,
+        permuted_local_hidden_states: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        permuted_probs: torch.Tensor,
+    ) -> Tuple[torch.Tensor, None]:
+        """Graph-capturable expert forward for the DeepEP V2 expand-layout dispatch.
+
+        DeepEP V2's expand mode (`do_expand=True`) writes one slot per
+        (token, expert) pair into a worst-case-sized recv buffer; the valid
+        prefix `[0, tokens_per_expert.sum())` is followed by padding rows that
+        combine() discards. We bypass TE GroupedLinear (whose `.tolist()` host
+        sync breaks CUDA graph capture) and call torch.nn.functional.grouped_mm
+        directly with on-device cumulative offsets. Padding rows past `offs[-1]`
+        are not visited by grouped_mm and end up as uninitialised output —
+        harmless because combine() ignores them.
+        """
+        try:
+            from torch.nn.functional import grouped_mm
+        except ImportError:
+            # Fallback to the private symbol for torch versions < 2.10.
+            grouped_mm = getattr(torch, "_grouped_mm", None)
+
+        assert (
+            permuted_local_hidden_states.dtype == torch.bfloat16
+        ), "deepep_v2 expand-layout forward currently supports BF16 only."
+        assert not self.config.add_bias_linear, (
+            "deepep_v2 expand-layout forward does not yet support add_bias_linear=True."
+        )
+
+        # Cumulative offsets per local expert, on device. With expert_alignment=1
+        # (set in DeepEPV2Dispatch.forward), this equals
+        # handle.psum_num_recv_tokens_per_expert exactly.
+        offs = tokens_per_expert.cumsum(0).to(torch.int32)
+
+        # FC1: input [N, hidden] @ weight^T → [N, ffn_hidden * (2 if gated else 1)]
+        # _fc1_weight is [num_local_experts, ffn_hidden_out, hidden]; grouped_mm
+        # wants [G, K, N], so transpose(1, 2).
+        fc1_output = grouped_mm(
+            permuted_local_hidden_states,
+            self._fc1_weight.transpose(1, 2),
+            offs=offs,
+        )
+
+        # Activation (+ per-row probs multiply, matching the standard TEGroupedMLP
+        # post-activation prob application).
+        probs_col = permuted_probs.unsqueeze(-1).to(fc1_output.dtype)
+        if self.config.gated_linear_unit:
+            # SwiGLU when activation_func is silu; otherwise generic gated form.
+            gate, up = fc1_output.chunk(2, dim=-1)
+            activation_out = self.config.activation_func(gate) * up
+        else:
+            activation_out = self.config.activation_func(fc1_output)
+        activation_out = activation_out * probs_col
+
+        # FC2: [N, ffn_hidden] @ weight^T → [N, hidden]
+        output = grouped_mm(
+            activation_out,
+            self._fc2_weight.transpose(1, 2),
+            offs=offs,
+        )
+        return output, None
+
     def _vllm_forward(self, hidden_states, probs, routing_map):
         """vLLM Triton fused MoE kernel forward (BF16, CUDA-graph safe)."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
@@ -705,10 +768,15 @@ class InferenceGroupedMLP(TEGroupedMLP):
             return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
 
         if self._deepep_v2_dispatcher:
-            # DeepEP V2 dispatch already produced the grouped per-expert layout the
-            # parent TEGroupedMLP forward consumes (rows ordered by local expert,
-            # boundaries given by tokens_per_expert).
-            return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
+            # Lazily build concatenated weights on first forward (after checkpoint load).
+            # The expand-layout forward calls torch.nn.functional.grouped_mm directly on
+            # the stacked weights instead of TE GroupedLinear's per-expert modules.
+            if not self._concatenated_weights_built:
+                self._build_concatenated_weights()
+                self._concatenated_weights_built = True
+            return self._deepep_v2_expand_forward(
+                permuted_local_hidden_states, tokens_per_expert, permuted_probs
+            )
 
         # Lazily build concatenated weights on first forward (after checkpoint load)
         if not self._concatenated_weights_built:
