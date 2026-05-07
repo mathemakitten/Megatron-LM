@@ -1203,12 +1203,20 @@ class _DeepepManager(_DispatchManager):
         # padded buffer with on-device cumulative offsets, implemented as
         # `InferenceGroupedMLP._deepep_v2_expand_forward`. combine() discards
         # padding slots, so wasted compute on padding rows is harmless.
+        # MCORE_DEEPEP_V2_DISABLE_EXPAND=1 forces the standard (non-expand) path
+        # for A/B-testing whether bugs live in the expanded-layout consumer. The
+        # non-expand path uses CPU sync so it cannot be CUDA-graphed, but for
+        # debugging correctness it routes through the same tested permute →
+        # grouped_gemm → combine flow used by training.
+        import os as _os
+        _disable_expand = _os.environ.get("MCORE_DEEPEP_V2_DISABLE_EXPAND", "0") == "1"
         self.enable_expanded_layout_for_inference = (
             self.use_deepep_v2
             and config.bf16
             and not config.fp8
             and not config.fp4
             and not config.moe_router_padding_for_quantization
+            and not _disable_expand
         )
         self.use_expanded_layout = False
         if not self.use_deepep_v2:
