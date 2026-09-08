@@ -1169,6 +1169,17 @@ class TransformerConfig(ModelParallelConfig):
     capture-time allocations via free-list reuse); persistent buffers additionally give
     deterministic, fixed buffer addresses independent of allocator policy. Disable to
     fall back to per-call allocations."""
+    inference_flashinfer_token_capacity: int | None = None
+    """Optional fixed token-row capacity for FlashInfer MoE.
+
+    Decode-only dynamic-inference graphs use this fixed prefix when their
+    host-known EP-wide token ceiling fits. Prefill, mixed, static-inference,
+    and oversized decode graphs retain the full dispatcher buffer. Requires
+    BF16 or MXFP8 parameters, the NVLS inference dispatcher, and EP > 1.
+    """
+
+    inference_flashinfer_mxfp8_token_capacity: int | None = None
+    """Deprecated alias for inference_flashinfer_token_capacity."""
 
     inference_moe_token_dispatcher_type: Literal['nccl', 'nvls'] = 'nvls'
     """Token dispatcher to use for MoE expert parallelism during inference.
@@ -1306,6 +1317,49 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+        self._validate_cp_layouts()
+
+        if self.inference_flashinfer_mxfp8_token_capacity is not None:
+            if (
+                self.inference_flashinfer_token_capacity is not None
+                and self.inference_flashinfer_token_capacity
+                != self.inference_flashinfer_mxfp8_token_capacity
+            ):
+                raise ValueError(
+                    "inference_flashinfer_token_capacity and its deprecated "
+                    "inference_flashinfer_mxfp8_token_capacity alias must match when both are set"
+                )
+            warnings.warn(
+                "inference_flashinfer_mxfp8_token_capacity is deprecated; use "
+                "inference_flashinfer_token_capacity instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            self.inference_flashinfer_token_capacity = (
+                self.inference_flashinfer_mxfp8_token_capacity
+            )
+
+        # Resolve deprecated attention variant spellings up front so that every consumer
+        # downstream only has to handle the canonical names. Imported lazily because the
+        # spec module imports this one.
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            is_gated_delta_net_variant,
+            normalize_experimental_attention_variant,
+        )
+
+        if self.experimental_attention_variant is not None:
+            self.experimental_attention_variant = normalize_experimental_attention_variant(
+                self.experimental_attention_variant
+            )
+
+        if self.use_transformer_engine_op_fuser and self.moe_grouped_gemm:
+            self.moe_use_grouped_tensor = True
+
+        if self.moe_use_grouped_tensor and not self.moe_grouped_gemm:
+            raise ValueError("moe_use_grouped_tensor=True requires moe_grouped_gemm=True.")
+
+        if self.mtp_hsm and (self.mtp_num_layers is None or self.mtp_num_layers < 2):
+            raise ValueError("mtp_hsm=True requires mtp_num_layers >= 2.")
 
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.
@@ -1542,6 +1596,40 @@ class TransformerConfig(ModelParallelConfig):
                     "vLLM Triton fused MoE only supports BF16. "
                     "Set inference_grouped_gemm_backend to 'torch' for MXFP8."
                 )
+
+            if (
+                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+                and mxfp8_enabled
+                and (self.gated_linear_unit or self.activation_func != squared_relu)
+            ):
+                raise ValueError(
+                    "FlashInfer routed MXFP8 MoE currently supports only non-gated "
+                    "squared-ReLU experts. Set activation_func=squared_relu and "
+                    "gated_linear_unit=False, or select inference_grouped_gemm_backend='torch'."
+                )
+
+            if self.inference_flashinfer_token_capacity is not None:
+                if self.inference_flashinfer_token_capacity <= 0:
+                    raise ValueError(
+                        "inference_flashinfer_token_capacity must be > 0, got "
+                        f"{self.inference_flashinfer_token_capacity}"
+                    )
+                if (
+                    self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.FLASHINFER
+                    or not (
+                        mxfp8_enabled
+                        or (not bool(self.fp8) and self.params_dtype == torch.bfloat16)
+                    )
+                    or self.inference_moe_token_dispatcher_type != "nvls"
+                    or self.expert_model_parallel_size <= 1
+                ):
+                    raise ValueError(
+                        "inference_flashinfer_token_capacity requires "
+                        "inference_grouped_gemm_backend='flashinfer', BF16 parameters "
+                        "with FP8 disabled or FP8 enabled with fp8_recipe='mxfp8', "
+                        "inference_moe_token_dispatcher_type='nvls' and "
+                        "expert_model_parallel_size > 1"
+                    )
 
             if self.batch_invariant_mode:
                 if self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.TORCH:
