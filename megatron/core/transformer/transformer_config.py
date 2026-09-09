@@ -9,6 +9,7 @@ from typing import Callable, List, Literal, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
+from megatron.core.activations import squared_relu
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.quantization.quant_config import RecipeConfig
@@ -1320,29 +1321,6 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
-        self._validate_cp_layouts()
-
-        # Resolve deprecated attention variant spellings up front so that every consumer
-        # downstream only has to handle the canonical names. Imported lazily because the
-        # spec module imports this one.
-        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
-            is_gated_delta_net_variant,
-            normalize_experimental_attention_variant,
-        )
-
-        if self.experimental_attention_variant is not None:
-            self.experimental_attention_variant = normalize_experimental_attention_variant(
-                self.experimental_attention_variant
-            )
-
-        if self.use_transformer_engine_op_fuser and self.moe_grouped_gemm:
-            self.moe_use_grouped_tensor = True
-
-        if self.moe_use_grouped_tensor and not self.moe_grouped_gemm:
-            raise ValueError("moe_use_grouped_tensor=True requires moe_grouped_gemm=True.")
-
-        if self.mtp_hsm and (self.mtp_num_layers is None or self.mtp_num_layers < 2):
-            raise ValueError("mtp_hsm=True requires mtp_num_layers >= 2.")
 
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.
@@ -1514,6 +1492,8 @@ class TransformerConfig(ModelParallelConfig):
         if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
             raise ValueError("num_moe_experts must be non None to use expert-parallel.")
 
+        mxfp8_enabled = bool(self.fp8) and self.fp8_recipe == Fp8Recipe.mxfp8
+
         if self.transformer_impl == "inference_optimized" and self.num_moe_experts is not None:
             if self.expert_tensor_parallel_size > 1:
                 raise ValueError(
@@ -1544,7 +1524,7 @@ class TransformerConfig(ModelParallelConfig):
                     f"got '{self.inference_grouped_gemm_backend}'."
                 )
 
-            if self.fp8 == "mxfp8":
+            if mxfp8_enabled:
                 if not self.fp8_param:
                     raise ValueError(
                         "fp8_param must be enabled when using "
@@ -1563,17 +1543,8 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
             if (
-                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
-                and self.fp8 == "mxfp8"
-            ):
-                raise ValueError(
-                    "FlashInfer is not compatible with MXFP8 quantization. "
-                    "Set inference_grouped_gemm_backend to 'torch'."
-                )
-
-            if (
                 self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM
-                and self.fp8 == "mxfp8"
+                and mxfp8_enabled
             ):
                 raise ValueError(
                     "vLLM Triton fused MoE only supports BF16. "

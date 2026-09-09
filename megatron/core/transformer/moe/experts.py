@@ -23,7 +23,8 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
-from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor, validate_mxfp8_tensor
+from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -1062,55 +1063,113 @@ class InferenceGroupedMLP(TEGroupedMLP):
             return McoreActivationType.SWIGLU
         raise ValueError(f"No mcore_fused_moe ActivationType mapping for activation_func={func}")
 
+    def _stack_mxfp8_linear_weight(self, linear_name: str, backend: str) -> MXFP8Tensor:
+        """Stack one linear's per-expert MXFP8 weights in canonical layout."""
+        linear = getattr(self, linear_name)
+        q_list, s_list = [], []
+        source_dtype: torch.dtype | None = None
+        for i in range(self.num_local_experts):
+            weight = getattr(linear, f'weight{i}')
+            if isinstance(weight, MXFP8Tensor):
+                mxfp8 = weight
+            elif hasattr(weight, 'data') and isinstance(weight.data, MXFP8Tensor):
+                mxfp8 = weight.data
+            else:
+                raise RuntimeError(
+                    f"Expected MXFP8Tensor for {linear_name}.weight{i}, "
+                    f"got {type(weight).__name__}. Was quantize_model_to_mxfp8 called?"
+                )
+            validate_mxfp8_tensor(
+                mxfp8, expected_backend=backend, tensor_name=f"{linear_name}.weight{i}"
+            )
+            if mxfp8.dtype is not None:
+                source_dtype = source_dtype or mxfp8.dtype
+                if mxfp8.dtype != source_dtype:
+                    raise RuntimeError(
+                        f"Conflicting source dtypes for {linear_name} expert weights: "
+                        f"{source_dtype} and {mxfp8.dtype}."
+                    )
+            q_list.append(mxfp8.data)
+            s_list.append(mxfp8.scale)
+        return MXFP8Tensor(
+            data=torch.stack(q_list, dim=0).contiguous(),
+            scale=torch.stack(s_list, dim=0).contiguous(),
+            dtype=source_dtype,
+            backend=backend,
+        )
+
+    @torch.inference_mode(False)
+    @torch.no_grad()
     def _build_concatenated_mxfp8_weights(self):
-        """Build stacked MXFP8 weight tensors from per-expert MXFP8Tensor attributes.
+        """Build contiguous expert stacks after checkpoint loading.
 
-        After quantize_model_to_mxfp8, each per-expert weight (weight0, weight1, ...)
-        has been replaced with an MXFP8Tensor. This method stacks their data and
-        scales into _fc1_weight / _fc2_weight for scaled_grouped_mm.
-
-        Note: this creates a contiguous copy since per-expert MXFP8Tensor attributes
-        are not contiguous across experts. This is a one-time cost at first forward.
-
-        Unlike _build_concatenated_weights, this does not create nn.Parameter views
-        back into the buffer — MXFP8 weights are not nn.Parameters (they are plain
-        MXFP8Tensor attributes set by quantize_model_to_mxfp8). This path is only
-        intended for non-colocated inference.
+        The torch backend rebinds each per-expert MXFP8Tensor to its stacked view.
+        FlashInfer keeps those canonical tensors for refit and derives a shuffled
+        Major-K stack for its routed-MoE kernel.
         """
 
+        use_flashinfer_routed = (
+            self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+        )
+        backend = resolve_mxfp8_backend(self.inference_grouped_gemm_backend)
+        if use_flashinfer_routed:
+            require_flashinfer_routed_mxfp8()
         for linear_name, buf_name in [('linear_fc1', '_fc1_weight'), ('linear_fc2', '_fc2_weight')]:
             linear = getattr(self, linear_name)
-            q_list, s_list = [], []
-            for i in range(self.num_local_experts):
-                w = getattr(linear, f'weight{i}')
-                if isinstance(w, MXFP8Tensor):
-                    mxfp8 = w
-                elif hasattr(w, 'data') and isinstance(w.data, MXFP8Tensor):
-                    mxfp8 = w.data
-                else:
-                    raise RuntimeError(
-                        f"Expected MXFP8Tensor for {linear_name}.weight{i}, "
-                        f"got {type(w).__name__}. Was quantize_model_to_mxfp8 called?"
-                    )
-                q_list.append(mxfp8.data)
-                s_list.append(mxfp8.scale)
+            stacked_weight = self._stack_mxfp8_linear_weight(linear_name, backend)
+            if use_flashinfer_routed:
+                concatenated_weight = prepare_routed_mxfp8_weights(stacked_weight)
+                logger.info(
+                    "Prepared FlashInfer routed MXFP8 %s weights: experts=%d "
+                    "shape=(%d, %d)->(%d, %d)",
+                    linear_name,
+                    self.num_local_experts,
+                    concatenated_weight.logical_rows,
+                    concatenated_weight.logical_cols,
+                    concatenated_weight.padded_rows,
+                    concatenated_weight.padded_cols,
+                )
+            else:
+                concatenated_weight = stacked_weight
+            setattr(self, buf_name, concatenated_weight)
 
-            stacked_data = torch.stack(q_list, dim=0).contiguous()
-            stacked_scale = torch.stack(s_list, dim=0).contiguous()
+            # The torch path can redirect per-expert storage into the stacked
+            # representation. FlashInfer keeps the canonical Triton tensors intact
+            # because its shuffled Major-K weights are a derived representation.
+            if not use_flashinfer_routed:
+                for i in range(self.num_local_experts):
+                    w = getattr(linear, f'weight{i}')
+                    if isinstance(w, MXFP8Tensor):
+                        w.data = stacked_weight.data[i]
+                        w.scale = stacked_weight.scale[i]
+                    elif hasattr(w, 'data') and isinstance(w.data, MXFP8Tensor):
+                        w.data.data = stacked_weight.data[i]
+                        w.data.scale = stacked_weight.scale[i]
 
-            setattr(self, buf_name, MXFP8Tensor(data=stacked_data, scale=stacked_scale))
+    @torch.inference_mode(False)
+    @torch.no_grad()
+    def refresh_flashinfer_mxfp8_weights(self) -> bool:
+        """Refresh routed Major-K expert weights in place after an MXFP8 refit.
 
-            # Redirect per-expert weight .data to views into the stacked buffer,
-            # mirroring _build_concatenated_weights. This frees the original
-            # allocations while keeping the Parameter objects intact.
-            for i in range(self.num_local_experts):
-                w = getattr(linear, f'weight{i}')
-                if isinstance(w, MXFP8Tensor):
-                    w.data = stacked_data[i]
-                    w.scale = stacked_scale[i]
-                elif hasattr(w, 'data') and isinstance(w.data, MXFP8Tensor):
-                    w.data.data = stacked_data[i]
-                    w.data.scale = stacked_scale[i]
+        Returns whether derived FlashInfer weights were refreshed.
+        """
+        if (
+            not self._concatenated_weights_built
+            or self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.FLASHINFER
+        ):
+            return False
+        require_flashinfer_routed_mxfp8()
+        backend = resolve_mxfp8_backend(self.inference_grouped_gemm_backend)
+        for linear_name, buf_name in [('linear_fc1', '_fc1_weight'), ('linear_fc2', '_fc2_weight')]:
+            routed_weight = getattr(self, buf_name)
+            if not isinstance(routed_weight, FlashInferRoutedMXFP8Weight):
+                raise RuntimeError(
+                    f"Expected {buf_name} to contain FlashInferRoutedMXFP8Weight, "
+                    f"got {type(routed_weight).__name__}."
+                )
+            stacked_weight = self._stack_mxfp8_linear_weight(linear_name, backend)
+            prepare_routed_mxfp8_weights(stacked_weight, out=routed_weight)
+        return True
 
     @torch.inference_mode(False)  # needed for non-colocated inference.
     def _build_concatenated_weights(self):
