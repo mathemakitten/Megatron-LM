@@ -69,8 +69,8 @@ def resolve_mxfp8_backend(
             string value or as the enum produced by ``TransformerConfig``.
 
     Returns:
-        The MXFP8 quantization and storage backend to use. FlashInfer routed MoE
-        derives its TRT-LLM Major-K weights from the canonical Triton/cuBLAS layout.
+        The MXFP8 quantization and storage backend to use. FlashInfer CUTLASS MoE
+        derives its ABI weights from the canonical Triton/cuBLAS layout.
 
     Raises:
         ValueError: If the grouped-GEMM backend does not support MXFP8.
@@ -79,7 +79,7 @@ def resolve_mxfp8_backend(
         inference_grouped_gemm_backend, "value", inference_grouped_gemm_backend
     )
     # All supported grouped-MoE backends consume MCore's canonical Triton/cuBLAS
-    # layout. FlashInfer repacks expert weights into TRT-LLM Major-K layout separately.
+    # layout. FlashInfer packs the scale bytes for its CUTLASS ABI separately.
     if grouped_gemm_backend in ("torch", "flashinfer", "vllm"):
         return "triton"
     raise ValueError(

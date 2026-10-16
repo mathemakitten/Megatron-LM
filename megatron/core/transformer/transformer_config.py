@@ -1450,10 +1450,10 @@ class TransformerConfig(ModelParallelConfig):
     inference_grouped_gemm_backend: Literal['flashinfer', 'torch', 'vllm'] = "vllm"
     """Specifies the backend to use for grouped GEMM operations during inference.
     Options:
-    - 'flashinfer': Uses FlashInfer cutlass_fused_moe for BF16 and TRT-LLM routed
-      block-scale MoE for MXFP8. The MXFP8 path retains canonical expert weights
-      for refit and also stores a padded TRT-LLM Major-K copy, increasing
-      expert-weight memory relative to the torch backend.
+    - 'flashinfer': Uses FlashInfer cutlass_fused_moe for BF16 and tanh-clamped
+      MXFP8 squared-ReLU, and routed block-scale MoE for other MXFP8 activations.
+      The MXFP8 path retains canonical expert weights for refit and also stores a
+      backend-specific derived copy.
     - 'torch': Uses torch.nn.functional.grouped_mm (mcore_fused_moe with Triton kernels).
       Supports both BF16 and MXFP8.
     - 'vllm': Uses vLLM's Triton fused MoE kernel for BF16. Avoids physical token
@@ -1468,7 +1468,7 @@ class TransformerConfig(ModelParallelConfig):
     True to disable fusion and use separate kernel launches (useful for debugging)."""
 
     inference_flashinfer_mxfp8_token_capacity: int | None = None
-    """Optional fixed token-row capacity for FlashInfer routed MXFP8 MoE.
+    """Optional fixed token-row capacity for FlashInfer MXFP8 MoE.
 
     Decode-only dynamic-inference graphs use this fixed prefix when their
     host-known EP-wide token ceiling fits. Prefill, mixed, static-inference,
@@ -2130,7 +2130,19 @@ class TransformerConfig(ModelParallelConfig):
                 and (self.gated_linear_unit or self.activation_func != squared_relu)
             ):
                 raise ValueError(
-                    "FlashInfer routed MXFP8 MoE currently supports only non-gated "
+                    "FlashInfer CUTLASS MXFP8 MoE currently supports only non-gated "
+                    "squared-ReLU experts. Set activation_func=squared_relu and "
+                    "gated_linear_unit=False, or select inference_grouped_gemm_backend "
+                    "'torch' or 'vllm'."
+                )
+
+            if (
+                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+                and self.activation_func_tanh_clamp_scale is not None
+                and (self.gated_linear_unit or self.activation_func != squared_relu)
+            ):
+                raise ValueError(
+                    "FlashInfer tanh-clamped activation currently supports only non-gated "
                     "squared-ReLU experts. Set activation_func=squared_relu and "
                     "gated_linear_unit=False, or select inference_grouped_gemm_backend "
                     "'torch' or 'vllm'."
